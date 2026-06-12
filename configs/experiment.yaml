@@ -1,0 +1,79 @@
+# GEPA core experiment configuration.
+# Keep data, results, caches and logs outside this repository.
+
+experiment:
+  name: "example_validation_decay"
+  seed: 130
+  benchmark: "HotpotQABench"
+  output_dir: "../runs/example_validation_decay"
+  backend:
+    type: "dry_run"              # dry_run | artifact
+    artifact_root: null          # null means this repository root
+    # Required only when backend.type="artifact".
+    benchmark_index: 0
+    program_index: 0
+    program_name: "HotpotMultiHop"
+    optimizer_index: 0
+    optimizer_name: "GEPA"
+    setting_name: "example_setting"
+
+run:
+  num_threads: 1
+  resume: true
+  cache_policy: "disabled"       # disabled | read_only | read_write
+  final_evaluation: true
+
+budget:
+  # Choose one primary stopping condition for production runs.
+  max_llm_calls: null            # Example: 5000
+  max_search_iterations: 200
+  max_metric_calls: null
+  max_seconds: null
+
+validation:
+  retained_fraction: 0.05        # 1.0, 0.75, 0.50, 0.25, 0.05, or 0.0
+  sampling_mode: "fixed"         # fixed retained validation subset for the whole run
+  decay:
+    enabled: true
+    metric: "validation_score"
+    min_delta: 0.0
+    normalize_scores: false
+
+judge:
+  enabled: false
+  version: "v1"                  # v1 | v2 | v3 | combined
+  combined: false
+  warmup_rollouts: 0
+  strict_learned_guide: false
+  memory_top_k: 3
+  same_predictor_only: true
+  model:
+    name: "qwen3-8b"
+    api_base: "http://127.0.0.1:8000/v1"
+    api_key_env: "OPENAI_API_KEY"
+    temperature: 0.0
+  combined_strategy:
+    validation_weight: 1.0
+    judge_weight: 1.0
+    normalize_validation_delta: true
+    tie_breaker: "validation"    # validation | judge | old_prompt
+  v3:
+    warmup_teacher_fraction: 0.05
+    distilled_pair_count: 5
+    similarity_threshold: 0.86
+    use_strict_memory: true
+
+program:
+  optimizer_lm:
+    name: "qwen3-8b"
+    api_base: "http://127.0.0.1:8000/v1"
+    api_key_env: "OPENAI_API_KEY"
+  task_lm:
+    name: "qwen3-8b"
+    api_base: "http://127.0.0.1:8000/v1"
+    api_key_env: "OPENAI_API_KEY"
+
+paths:
+  data_dir: "../data"
+  result_dir: "../runs"
+  cache_dir: "../cache"
