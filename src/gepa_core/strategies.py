@@ -57,6 +57,7 @@ def build_strategy_plan(config: ExperimentConfig) -> StrategyPlan:
         )
 
     selection_mode = "llm_judge_score_aware" if judge.version == "v1" else "llm_judge"
+    strict_versions = {"v3", "v4", "v5_rules_only", "v5_rules_fewshot"}
     return StrategyPlan(
         mode=ExperimentMode.WARMUP_THEN_LLM_JUDGE if judge.warmup_rollouts > 0 else ExperimentMode.PURE_LLM_JUDGE,
         selection_mode=selection_mode,
@@ -65,6 +66,5 @@ def build_strategy_plan(config: ExperimentConfig) -> StrategyPlan:
         uses_validation=judge.warmup_rollouts > 0,
         uses_judge=True,
         uses_combined_score=False,
-        strict_learned_guide=judge.version == "v3" or judge.strict_learned_guide,
+        strict_learned_guide=judge.version in strict_versions or judge.strict_learned_guide,
     )
-

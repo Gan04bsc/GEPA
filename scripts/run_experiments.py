@@ -8,15 +8,19 @@ import time
 import json
 import traceback
 import random
+import secrets
 import subprocess
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SRC_ROOT = PROJECT_ROOT / "src"
+VENDORED_DSPY_ROOT = SRC_ROOT / "gepa_artifact" / "utils" / "dspy"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+if VENDORED_DSPY_ROOT.exists() and str(VENDORED_DSPY_ROOT) not in sys.path:
+    sys.path.insert(0, str(VENDORED_DSPY_ROOT))
 
 try:
     from dotenv import dotenv_values, load_dotenv
@@ -182,6 +186,8 @@ def bootstrap_openai_compatible_env():
     vendor_dir = PROJECT_ROOT / ".vendor"
     if vendor_dir.exists():
         pythonpath_roots.append(vendor_dir)
+    if VENDORED_DSPY_ROOT.exists():
+        pythonpath_roots.append(VENDORED_DSPY_ROOT)
     existing_pythonpath = os.environ.get("PYTHONPATH", "")
     pythonpath_entries = [entry for entry in existing_pythonpath.split(os.pathsep) if entry]
     for root in pythonpath_roots:
@@ -274,13 +280,45 @@ def prepare_resume_sidecars(run_dir):
     }
 
 
-def apply_retained_validation_fraction(benchmark, retained_validation_fraction, selection_mode, seed, validation_sampling_mode="random_per_iteration"):
+def apply_retained_validation_fraction(
+    benchmark,
+    retained_validation_fraction,
+    selection_mode,
+    seed,
+    validation_sampling_mode="fixed",
+    validation_subset_seed=None,
+    existing_subset_payload=None,
+):
+    if validation_sampling_mode != "fixed":
+        raise ValueError(
+            "validation_sampling_mode='random_per_iteration' has been removed. "
+            "Use the default fixed mode, which randomly selects the retained validation subset once per run."
+        )
+
     original_val_size = len(benchmark.val_set)
+    existing_retained_positions = None
+    selection_seed_source = "generated"
+    if existing_subset_payload:
+        if existing_subset_payload.get("sampling_mode") != "fixed":
+            raise ValueError(
+                f"Cannot reuse validation subset with sampling_mode={existing_subset_payload.get('sampling_mode')!r}; "
+                "only fixed validation subsets are supported."
+            )
+        existing_retained_positions = existing_subset_payload.get("retained_positions")
+        validation_subset_seed = existing_subset_payload.get("selection_seed", validation_subset_seed)
+        selection_seed_source = "existing_run"
+
+    if validation_subset_seed is None and not existing_retained_positions:
+        validation_subset_seed = secrets.randbits(32)
+    elif selection_seed_source != "existing_run":
+        selection_seed_source = "provided"
+
     payload = {
         "selection_mode": selection_mode,
         "retained_validation_fraction": retained_validation_fraction,
         "original_val_size": original_val_size,
-        "selection_seed": seed + 7919,
+        "selection_seed": validation_subset_seed,
+        "selection_seed_source": selection_seed_source,
     }
 
     if selection_mode_uses_judge(selection_mode) and not selection_mode_uses_retained_validation(selection_mode):
@@ -306,28 +344,31 @@ def apply_retained_validation_fraction(benchmark, retained_validation_fraction, 
 
     keep_count = original_val_size if retained_validation_fraction >= 100 else max(1, math.ceil(original_val_size * retained_validation_fraction / 100.0))
 
-    if validation_sampling_mode == "fixed":
-        # Legacy behaviour: select a fixed subset once and truncate the valset.
-        selection_rng = random.Random(seed + 7919)
+    if existing_retained_positions is not None:
+        retained_positions = list(existing_retained_positions)
+        if len(retained_positions) != keep_count:
+            raise ValueError(
+                f"Existing validation subset has {len(retained_positions)} examples, "
+                f"but retained_validation_fraction={retained_validation_fraction} requires {keep_count}."
+            )
+        if any(pos < 0 or pos >= original_val_size for pos in retained_positions):
+            raise ValueError("Existing validation subset contains positions outside the current validation split.")
+        retained_positions = sorted(retained_positions)
+    elif retained_validation_fraction >= 100:
+        retained_positions = list(range(original_val_size))
+    else:
+        selection_rng = random.Random(validation_subset_seed)
         candidate_positions = list(range(original_val_size))
         selection_rng.shuffle(candidate_positions)
         retained_positions = sorted(candidate_positions[:keep_count])
-        benchmark.val_set = [benchmark.val_set[i] for i in retained_positions]
-        payload.update({
-            "applied": keep_count != original_val_size,
-            "sampling_mode": "fixed",
-            "retained_val_size": len(benchmark.val_set),
-            "retained_positions": retained_positions,
-        })
-    else:
-        # Per-iteration random sampling: keep the full valset; subsampling happens inside the optimizer.
-        payload.update({
-            "applied": keep_count != original_val_size,
-            "sampling_mode": "random_per_iteration",
-            "retained_val_size_per_iteration": keep_count,
-            "original_val_size": original_val_size,
-            "retained_validation_fraction": retained_validation_fraction,
-        })
+
+    benchmark.val_set = [benchmark.val_set[i] for i in retained_positions]
+    payload.update({
+        "applied": keep_count != original_val_size,
+        "sampling_mode": "fixed",
+        "retained_val_size": len(benchmark.val_set),
+        "retained_positions": retained_positions,
+    })
     return payload
 
 
@@ -786,7 +827,8 @@ def run_experiment_and_write_results_actual(
     seed=0,
     setting_name=None,
     retained_validation_fraction=100.0,
-    validation_sampling_mode="random_per_iteration",
+    validation_sampling_mode="fixed",
+    validation_subset_seed=None,
     selection_mode="validation",
     judge_lm_config=None,
     judge_learned_guide_path=None,
@@ -802,6 +844,7 @@ def run_experiment_and_write_results_actual(
     combined_min_surrogate_gain=0.01,
     override_max_metric_calls=None,
     override_max_total_api_calls=None,
+    override_max_total_search_tokens=None,
     api_call_hard_limit=None,
     override_max_search_iterations=None,
     skip_final_evaluation=False,
@@ -809,8 +852,11 @@ def run_experiment_and_write_results_actual(
     smoke_train_size=None,
     smoke_val_size=None,
     smoke_test_size=None,
+    log_all_io=None,
 ):
     bootstrap_openai_compatible_env()
+    if benchmark_name == "Papillon":
+        os.environ.setdefault("GEPA_PAPILLON_AUX_MODEL", "openai/qwen3-8b")
     base_experiment_dir = BASE_EXPERIMENT_DIR
     lm_config = resolve_api_key_env_vars(copy.deepcopy(lm_config))
     judge_lm_config = resolve_api_key_env_vars(copy.deepcopy(judge_lm_config))
@@ -822,6 +868,17 @@ def run_experiment_and_write_results_actual(
     if setting_name:
         run_name = f"{run_name}__{setting_name}"
     runs_dir = os.path.join(runs_dir_basepath, run_name)
+    log_all_io_effective = (
+        env_flag_is_true("GEPA_LOG_ALL_IO", default=False)
+        or env_flag_is_true("GEPA_LM_IO_TRACE_ENABLED", default=False)
+    ) if log_all_io is None else bool(log_all_io)
+    from gepa_artifact.utils.lm_io_trace import configure_lm_io_trace, lm_trace_context
+
+    lm_io_trace_path = configure_lm_io_trace(
+        run_dir=runs_dir,
+        run_id=f"{run_name}__seed_{seed}",
+        enabled=log_all_io_effective,
+    )
 
     #######################
     # Cache Setup:
@@ -901,6 +958,19 @@ def run_experiment_and_write_results_actual(
         benchmark.train_set = combined_train_val[:train_size]
         benchmark.val_set = combined_train_val[train_size:]
 
+    existing_validation_subset_payload = None
+    existing_validation_subset_path = os.path.join(runs_dir, "validation_subset_ids.json")
+    if os.path.exists(existing_validation_subset_path):
+        existing_payload = load_json_from_path(existing_validation_subset_path, default={})
+        if existing_payload.get("sampling_mode") == "fixed":
+            existing_validation_subset_payload = existing_payload
+        elif resume_incomplete and os.path.exists(os.path.join(runs_dir, "gepa_state.bin")):
+            raise ValueError(
+                f"{runs_dir} was created with validation_sampling_mode={existing_payload.get('sampling_mode')!r}. "
+                "Per-iteration validation resampling has been removed, so this run cannot be resumed safely. "
+                "Move the old run directory aside and start a new fixed-subset run."
+            )
+
     smoke_subset_payload = apply_smoke_subset(
         benchmark=benchmark,
         seed=seed,
@@ -914,6 +984,8 @@ def run_experiment_and_write_results_actual(
         selection_mode=selection_mode,
         seed=seed,
         validation_sampling_mode=validation_sampling_mode,
+        validation_subset_seed=validation_subset_seed,
+        existing_subset_payload=existing_validation_subset_payload,
     )
 
     assert benchmark_name == (benchmark_meta.name or benchmark.__class__.__name__)
@@ -1002,8 +1074,12 @@ def run_experiment_and_write_results_actual(
             directory_existed = False
     else:
         directory_existed = run_completed
-    
+
     os.makedirs(runs_dir, exist_ok=True)
+    if directory_existed:
+        print(f"Run directory {runs_dir} already exists. Skipping...")
+        return
+
     write_json_to_path(os.path.join(runs_dir, "benchmark_subset_ids.json"), smoke_subset_payload)
     write_json_to_path(os.path.join(runs_dir, "validation_subset_ids.json"), validation_subset_payload)
     run_manifest = {
@@ -1027,12 +1103,17 @@ def run_experiment_and_write_results_actual(
         "combined_min_surrogate_gain": combined_min_surrogate_gain,
         "retained_validation_fraction": retained_validation_fraction,
         "validation_sampling_mode": validation_sampling_mode,
+        "validation_subset_seed": validation_subset_payload.get("selection_seed"),
         "skip_final_evaluation": skip_final_evaluation,
         "benchmark_subset": smoke_subset_payload,
         "validation_subset": validation_subset_payload,
         "dataset_source": getattr(benchmark, "dataset_source", None),
         "split_protocol": getattr(benchmark, "split_protocol", None),
         "final_evaluation_cache_disabled": bool(getattr(benchmark, "disable_cache_for_final_evaluation", False)),
+        "lm_io_trace_enabled": log_all_io_effective,
+        "lm_io_trace_path": lm_io_trace_path,
+        "metric_log_examples_enabled": log_all_io_effective,
+        "metric_log_traces_enabled": log_all_io_effective,
         "launch_arbor_requested": launch_arbor_requested,
         "launch_arbor_effective": launch_arbor_effective,
         "launch_arbor_disable_reason": launch_arbor_disable_reason,
@@ -1051,6 +1132,8 @@ def run_experiment_and_write_results_actual(
         run_manifest["override_max_metric_calls"] = int(override_max_metric_calls)
     if override_max_total_api_calls is not None:
         run_manifest["override_max_total_api_calls"] = int(override_max_total_api_calls)
+    if override_max_total_search_tokens is not None:
+        run_manifest["override_max_total_search_tokens"] = int(override_max_total_search_tokens)
     if api_call_hard_limit is not None:
         run_manifest["api_call_hard_limit"] = int(api_call_hard_limit)
     if override_max_search_iterations is not None:
@@ -1120,9 +1203,10 @@ def run_experiment_and_write_results_actual(
             train_dataset=benchmark.train_set,
             val_dataset=benchmark.val_set,
             test_dataset=benchmark.test_set,
-            # log_example=True,
-            log_prediction=True
-        ) as metric_fn_with_logger, Logger(os.path.join(runs_dir, "run_log.txt")) as logger: # 
+            log_trace=log_all_io_effective,
+            log_example=log_all_io_effective,
+            log_prediction=True,
+        ) as metric_fn_with_logger, Logger(os.path.join(runs_dir, "run_log.txt")) as logger: #
             # logger = Logger(os.path.join(runs_dir, "run_log.txt"))
             if optimizer_config is not None and "launch_arbor" in optimizer_config.langProBe_configs and optimizer_config.langProBe_configs["launch_arbor"]:
                 logger.log("Arbor in session:", arbor_runner_context.session_name)
@@ -1208,12 +1292,9 @@ def run_experiment_and_write_results_actual(
                         "selection_mode": selection_mode,
                         "retained_validation_fraction": retained_validation_fraction,
                         "validation_sampling_mode": validation_sampling_mode,
+                        "validation_subset_seed": validation_subset_payload.get("selection_seed"),
                         "skip_final_evaluation": skip_final_evaluation,
                     }, f, default=json_encoder)
-
-            if directory_existed:
-                print(f"Run directory {runs_dir} already exists. Skipping...")
-                return
 
             eval_results = EvaluationResult(
                 benchmark=benchmark_name,
@@ -1233,7 +1314,7 @@ def run_experiment_and_write_results_actual(
                 compile_args = copy.deepcopy(optimizer_config.compile_args)
                 langProBe_configs = copy.deepcopy(optimizer_config.langProBe_configs) | {"name": optimizer_config.name}
                 judge_lm = None
-                
+
                 #######################
                 # Add various configurations to the init_args of the optimizer
                 #######################
@@ -1242,27 +1323,36 @@ def run_experiment_and_write_results_actual(
                 if "provide_logdir_in_init" in optimizer_config.langProBe_configs and optimizer_config.langProBe_configs["provide_logdir_in_init"]:
                     init_args["log_dir"] = os.path.join(runs_dir, "optimizer_logs")
                     os.makedirs(init_args["log_dir"], exist_ok=True)
-                
+
                 if "add_max_errors_to_initargs" in optimizer_config.langProBe_configs and optimizer_config.langProBe_configs["add_max_errors_to_initargs"]:
                     init_args["max_errors"] = (len(benchmark.train_set) + len(benchmark.val_set)) * 100
 
                 if "add_max_metric_calls" in optimizer_config.langProBe_configs and optimizer_config.langProBe_configs["add_max_metric_calls"]:
                     # f"{benchmark_name}_{prog_name}_{optim_name}_{lm_name}"
-                    if override_max_total_api_calls is None and override_max_search_iterations is None:
+                    if override_max_total_api_calls is None and override_max_total_search_tokens is None and override_max_search_iterations is None:
                         num_mipro_invocations = get_max_invocations(benchmark_name, prog_name, metric_lm_name, opt=optimizer_config.langProBe_configs.get("max_metric_calls_source_opt_name"))
                         assert num_mipro_invocations is not None, f"Could not find max invocations for {benchmark_name}, {prog_name}, {metric_lm_name}"
                         init_args["max_metric_calls"] = num_mipro_invocations
 
                 if override_max_metric_calls is not None:
                     init_args.pop("max_total_api_calls", None)
+                    init_args.pop("max_total_search_tokens", None)
                     init_args.pop("max_search_iterations", None)
                     init_args["max_metric_calls"] = int(override_max_metric_calls)
                 if override_max_total_api_calls is not None:
                     init_args.pop("max_metric_calls", None)
                     init_args.pop("max_evals_per_trainval_instance", None)
                     init_args.pop("num_iters", None)
+                    init_args.pop("max_total_search_tokens", None)
                     init_args.pop("max_search_iterations", None)
                     init_args["max_total_api_calls"] = int(override_max_total_api_calls)
+                if override_max_total_search_tokens is not None:
+                    init_args.pop("max_metric_calls", None)
+                    init_args.pop("max_evals_per_trainval_instance", None)
+                    init_args.pop("num_iters", None)
+                    init_args.pop("max_total_api_calls", None)
+                    init_args.pop("max_search_iterations", None)
+                    init_args["max_total_search_tokens"] = int(override_max_total_search_tokens)
                 if api_call_hard_limit is not None:
                     init_args["api_call_hard_limit"] = int(api_call_hard_limit)
                 if override_max_search_iterations is not None:
@@ -1270,8 +1360,9 @@ def run_experiment_and_write_results_actual(
                     init_args.pop("max_evals_per_trainval_instance", None)
                     init_args.pop("num_iters", None)
                     init_args.pop("max_total_api_calls", None)
+                    init_args.pop("max_total_search_tokens", None)
                     init_args["max_search_iterations"] = int(override_max_search_iterations)
-                
+
                 if "add_wandb_configs_to_initargs" in optimizer_config.langProBe_configs and optimizer_config.langProBe_configs["add_wandb_configs_to_initargs"]:
                     init_args["use_wandb"] = use_wandb
                     if use_wandb:
@@ -1296,24 +1387,36 @@ def run_experiment_and_write_results_actual(
 
                 if "set_lm_before_optimizer" in langProBe_configs and langProBe_configs["set_lm_before_optimizer"]:
                     program.set_lm(lm_for_optimizer)
-                
+
                 print("STARTING COMPILATION FOR", benchmark_name, prog_name, optim_name, lm_name, evalsetname, "seed", seed)
                 optimizer_phase_start = time.perf_counter()
 
                 if "add_valset_to_trainset" in langProBe_configs and langProBe_configs["add_valset_to_trainset"]:
                     assert "use_valset" not in langProBe_configs or not langProBe_configs["use_valset"]
-                    optimized_program = optimizer.compile(
-                        program,
-                        trainset = benchmark.train_set + benchmark.val_set,
-                        **compile_args,
-                    )
+                    with lm_trace_context(
+                        "optimization",
+                        benchmark_name=benchmark_name,
+                        program_name=prog_name,
+                        optimizer_name=optim_name,
+                    ):
+                        optimized_program = optimizer.compile(
+                            program,
+                            trainset = benchmark.train_set + benchmark.val_set,
+                            **compile_args,
+                        )
                 elif "use_valset" in langProBe_configs and langProBe_configs["use_valset"]:
-                    optimized_program = optimizer.compile(
-                        program,
-                        trainset=benchmark.train_set,
-                        valset=benchmark.val_set,
-                        **compile_args,
-                    )
+                    with lm_trace_context(
+                        "optimization",
+                        benchmark_name=benchmark_name,
+                        program_name=prog_name,
+                        optimizer_name=optim_name,
+                    ):
+                        optimized_program = optimizer.compile(
+                            program,
+                            trainset=benchmark.train_set,
+                            valset=benchmark.val_set,
+                            **compile_args,
+                        )
                 else:
                     assert False
                 phase_wall_clock["optimizer_seconds"] = time.perf_counter() - optimizer_phase_start
@@ -1364,7 +1467,13 @@ def run_experiment_and_write_results_actual(
                 eval_lm = create_lm(eval_lm_config)
                 dspy.configure(lm=eval_lm, adapter=adapter)
                 evaluation_phase_start = time.perf_counter()
-                score_result = evaluate_prog(optimized_program)
+                with lm_trace_context(
+                    "final_test_eval",
+                    benchmark_name=benchmark_name,
+                    program_name=prog_name,
+                    optimizer_name=optim_name,
+                ):
+                    score_result = evaluate_prog(optimized_program)
                 phase_wall_clock["evaluation_seconds"] = time.perf_counter() - evaluation_phase_start
                 eval_results.score = getattr(score_result, "score", score_result)
                 eval_results.cost, eval_results.input_tokens, eval_results.output_tokens = calculate_stats(
@@ -1425,7 +1534,7 @@ def run_experiment_and_write_results(*args, **kwargs):
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='A program with boolean arguments.')
-    
+
     # Argument 1: dry_run
     # Defaults to False. If --dry_run is passed, it becomes True.
     parser.add_argument(
@@ -1447,9 +1556,11 @@ def parse_arguments():
     parser.add_argument('--seed', type=int, default=0, help='Random seed for reproducibility (default: 0)')
     parser.add_argument('--setting_name', type=str, default=None, help='Optional suffix for run naming and summaries')
     parser.add_argument('--retained_validation_fraction', type=float, default=100.0, help='Retained validation fraction in percent, e.g. 100, 75, 50, 25')
-    parser.add_argument('--validation_sampling_mode', type=str, default='random_per_iteration',
-                        choices=['fixed', 'random_per_iteration'],
-                        help='How validation examples are selected: fixed (pre-split once) or random_per_iteration (re-sample each iteration).')
+    parser.add_argument('--validation_sampling_mode', type=str, default='fixed',
+                        choices=['fixed'],
+                        help='Validation examples are randomly selected once at run start and then fixed for the whole run.')
+    parser.add_argument('--validation_subset_seed', type=int, default=None,
+                        help='Optional seed for the retained validation subset. If omitted, a random seed is generated per new run.')
     parser.add_argument(
         '--selection_mode',
         type=str,
@@ -1497,6 +1608,7 @@ def parse_arguments():
     parser.add_argument('--combined_min_surrogate_gain', type=float, default=0.01, help='Minimum positive surrogate gain for accepted combined-selection candidates')
     parser.add_argument('--override_max_metric_calls', type=int, default=None, help='Optional explicit max_metric_calls override for smoke/probe runs')
     parser.add_argument('--override_max_total_api_calls', type=int, default=None, help='Optional optimizer+judge API-call budget for GEPA search')
+    parser.add_argument('--override_max_total_search_tokens', type=int, default=None, help='Optional optimizer+judge token budget for GEPA search')
     parser.add_argument('--api_call_hard_limit', type=int, default=None, help='Optional secondary optimizer+judge API-call hard limit')
     parser.add_argument('--override_max_search_iterations', type=int, default=None, help='Optional GEPA search-iteration budget')
     parser.add_argument('--skip_final_evaluation', action=argparse.BooleanOptionalAction, default=False, help='Skip the final test-set evaluation and write search-only summaries')
@@ -1504,6 +1616,12 @@ def parse_arguments():
     parser.add_argument('--smoke_train_size', type=int, default=None, help='Optional runner-layer train subset size for smoke only')
     parser.add_argument('--smoke_val_size', type=int, default=None, help='Optional runner-layer validation subset size for smoke only')
     parser.add_argument('--smoke_test_size', type=int, default=None, help='Optional runner-layer test subset size for smoke only')
+    parser.add_argument(
+        '--log_all_io',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Record all LM request/response JSONL plus metric examples/traces for optimization, validation, judge, and final-test stages. Defaults to GEPA_LOG_ALL_IO.',
+    )
 
     args = parser.parse_args()
 
@@ -1517,7 +1635,7 @@ if __name__ == "__main__":
     bootstrap_openai_compatible_env()
     if "OPENAI_API_KEY" not in os.environ:
         raise ValueError("Please set OPENAI_API_KEY or PAPILLON_API_KEY before running experiments.")
-    if (not args.dry_run) and env_flag_is_true("GEPA_USE_WANDB", default=True) and "WANDB_API_KEY" not in os.environ:
+    if env_flag_is_true("GEPA_USE_WANDB", default=True) and "WANDB_API_KEY" not in os.environ:
         raise ValueError("Please set WANDB_API_KEY or disable wandb with GEPA_USE_WANDB=0 before running experiments.")
     args = parse_arguments()
     run_experiment_and_write_results(

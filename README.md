@@ -5,8 +5,9 @@ Standalone GEPA experiment runner for validation-decay and LLM-judge prompt opti
 ## Features
 
 - Validation-only prompt selection with configurable retained validation fraction.
-- LLM judge prompt selection with `v1`, `v2`, `v3`, and `combined` strategies.
+- LLM judge prompt selection with `v1`, `v2`, `v3`, `v4`, `v5_rules_only`, `v5_rules_fewshot`, and `combined` strategies.
 - Warm-up protocols: use validation decay for N rollouts, distill teacher prompt pairs, then switch to LLM judge.
+- v5 rules protocols: distill a rules library from all warm-up examples, then optionally add top teacher/alignment few-shot pairs.
 - API-call, search-iteration, metric-call, and wall-time budget configuration.
 - Cost accounting buckets for optimization, judge, minibatch, validation, and final evaluation.
 - Benchmark adapters for HotpotQA, HoVer, IFBench, AIME, Papillon, and LiveBench Math.
@@ -94,11 +95,12 @@ Important fields:
 | `paths.result_dir` | Experiment output directory outside the repo. Also passed as `GEPA_EXPERIMENT_DIR`. |
 | `budget.max_llm_calls` | Total optimizer + judge API-call budget. |
 | `budget.max_search_iterations` | Search-iteration budget. |
+| `budget.max_search_tokens` | Optimizer + judge token budget. Final test evaluation is outside this stopping budget. |
 | `budget.max_metric_calls` | Metric-call budget. |
 | `validation.retained_fraction` | Validation fraction, e.g. `1.0`, `0.25`, `0.05`, `0.0`. |
 | `validation.sampling_mode` | `fixed`. The retained validation subset is sampled once per run and reused throughout the run. |
 | `judge.enabled` | Enables LLM judge selection. |
-| `judge.version` | `v1`, `v2`, `v3`, or `combined`. |
+| `judge.version` | `v1`, `v2`, `v3`, `v4`, `v5_rules_only`, `v5_rules_fewshot`, or `combined`. |
 | `judge.warmup_rollouts` | `0` means pure LLM judge; `>0` means validation warm-up before judge. |
 | `judge.combined` | Enables validation + LLM judge combined scoring. |
 
@@ -168,6 +170,43 @@ Semantics:
 2. Warm-up records old/new prompt pairs, minibatch feedback, validation scores, and teacher preference.
 3. v3 distills a small set of high-signal teacher pairs.
 4. Continuation uses only the distilled guide plus current minibatch feedback for LLM judge selection.
+
+### Warm-up + Rules Judge v5
+
+`v5_rules_only`:
+
+```yaml
+judge:
+  enabled: true
+  version: "v5_rules_only"
+  combined: false
+  warmup_rollouts: 50
+  strict_learned_guide: true
+  v5:
+    max_rules: 50
+budget:
+  max_llm_calls: 5000
+  max_search_iterations: null
+  max_metric_calls: null
+```
+
+Semantics:
+
+1. Warm-up uses fixed 5% validation decay.
+2. Warm-up records successful and failed prompt edits with validation-teacher outcomes.
+3. An LLM distills a rules library with at most 50 concrete rules.
+4. Continuation judge sees only the rules library plus current minibatch feedback.
+
+`v5_rules_fewshot` uses the same rules library, plus top-3 validation-teacher pairs and top-2 high-confidence alignment-mistake pairs:
+
+```yaml
+judge:
+  enabled: true
+  version: "v5_rules_fewshot"
+  warmup_rollouts: 50
+  strict_learned_guide: true
+  memory_top_k: 3
+```
 
 ### Combined Strategy
 

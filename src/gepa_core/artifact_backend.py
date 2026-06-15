@@ -88,7 +88,7 @@ def build_artifact_command(config: ExperimentConfig, strategy: StrategyPlan, *, 
         command.extend(
             [
                 "--memory_protocol_version",
-                f"mem_llm_{config.judge.version}",
+                _memory_protocol_version(config.judge.version),
                 "--warmup_search_iterations",
                 str(strategy.warmup_rollouts),
             ]
@@ -97,6 +97,7 @@ def build_artifact_command(config: ExperimentConfig, strategy: StrategyPlan, *, 
     else:
         command.extend(["--selection_mode", strategy.selection_mode])
         _append_single_phase_budget(command, config)
+        command.append("--log_all_io")
 
     if config.judge.enabled:
         command.extend(["--judge_lm_config", json.dumps(_model_payload(config.judge.model or config.program.optimizer_lm))])
@@ -145,6 +146,8 @@ def _repo_root() -> Path:
 def _append_single_phase_budget(command: list[str], config: ExperimentConfig) -> None:
     if config.budget.max_llm_calls is not None:
         command.extend(["--override_max_total_api_calls", str(config.budget.max_llm_calls)])
+    if config.budget.max_search_tokens is not None:
+        command.extend(["--override_max_total_search_tokens", str(config.budget.max_search_tokens)])
     if config.budget.max_search_iterations is not None:
         command.extend(["--override_max_search_iterations", str(config.budget.max_search_iterations)])
     if config.budget.max_metric_calls is not None:
@@ -156,15 +159,18 @@ def _append_total_budget(command: list[str], config: ExperimentConfig) -> None:
         config.budget.max_llm_calls is not None,
         config.budget.max_search_iterations is not None,
         config.budget.max_metric_calls is not None,
+        getattr(config.budget, "max_search_tokens", None) is not None,
     ]
     if sum(limits) != 1:
-        raise ValueError("Two-phase artifact runs require exactly one of max_llm_calls, max_search_iterations, or max_metric_calls.")
+        raise ValueError("Two-phase artifact runs require exactly one of max_llm_calls, max_search_iterations, max_metric_calls, or max_search_tokens.")
     if config.budget.max_llm_calls is not None:
         command.extend(["--total_api_calls", str(config.budget.max_llm_calls)])
     elif config.budget.max_search_iterations is not None:
         command.extend(["--total_search_iterations", str(config.budget.max_search_iterations)])
     elif config.budget.max_metric_calls is not None:
         command.extend(["--total_metric_calls", str(config.budget.max_metric_calls)])
+    elif getattr(config.budget, "max_search_tokens", None) is not None:
+        command.extend(["--total_search_tokens", str(config.budget.max_search_tokens)])
 
 
 def _model_payload(model: ModelConfig) -> dict[str, str | float | None]:
@@ -175,6 +181,20 @@ def _model_payload(model: ModelConfig) -> dict[str, str | float | None]:
         payload["api_key"] = f"env:{model.api_key_env}"
     payload["temperature"] = model.temperature
     return payload
+
+
+def _memory_protocol_version(judge_version: str) -> str:
+    mapping = {
+        "v1": "mem_llm_v1",
+        "v2": "mem_llm_v2",
+        "v3": "mem_llm_v3",
+        "v4": "mem_llm_v4",
+        "v5_rules_only": "mem_llm_v5_rules_only",
+        "v5_rules_fewshot": "mem_llm_v5_rules_fewshot",
+    }
+    if judge_version not in mapping:
+        raise ValueError(f"Unsupported two-phase judge version: {judge_version}")
+    return mapping[judge_version]
 
 
 def _require_backend_fields(config: ExperimentConfig) -> None:

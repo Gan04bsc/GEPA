@@ -7,7 +7,7 @@ from typing import Any, Literal
 import yaml
 
 
-JudgeVersion = Literal["v1", "v2", "v3", "combined"]
+JudgeVersion = Literal["v1", "v2", "v3", "v4", "v5_rules_only", "v5_rules_fewshot", "combined"]
 SamplingMode = Literal["fixed"]
 CachePolicy = Literal["disabled", "read_only", "read_write"]
 
@@ -44,6 +44,7 @@ class RunConfig:
 @dataclass(frozen=True)
 class BudgetConfig:
     max_llm_calls: int | None = None
+    max_search_tokens: int | None = None
     max_search_iterations: int | None = None
     max_metric_calls: int | None = None
     max_seconds: float | None = None
@@ -53,6 +54,7 @@ class BudgetConfig:
             key: value
             for key, value in {
                 "max_llm_calls": self.max_llm_calls,
+                "max_search_tokens": self.max_search_tokens,
                 "max_search_iterations": self.max_search_iterations,
                 "max_metric_calls": self.max_metric_calls,
                 "max_seconds": self.max_seconds,
@@ -101,6 +103,14 @@ class V3Config:
 
 
 @dataclass(frozen=True)
+class V5Config:
+    max_rules: int = 50
+    include_fewshot: bool | None = None
+    teacher_pair_count: int = 3
+    alignment_pair_count: int = 2
+
+
+@dataclass(frozen=True)
 class JudgeConfig:
     enabled: bool = False
     version: JudgeVersion = "v1"
@@ -112,6 +122,7 @@ class JudgeConfig:
     model: ModelConfig | None = None
     combined_strategy: CombinedStrategyConfig = field(default_factory=CombinedStrategyConfig)
     v3: V3Config = field(default_factory=V3Config)
+    v5: V5Config = field(default_factory=V5Config)
 
 
 @dataclass(frozen=True)
@@ -147,6 +158,11 @@ class ExperimentConfig:
             raise ValueError("judge.model is required when judge.enabled=true.")
         if self.judge.version == "v3" and self.judge.enabled and self.judge.v3.distilled_pair_count <= 0:
             raise ValueError("judge.v3.distilled_pair_count must be positive for v3.")
+        if self.judge.version.startswith("v5") and self.judge.enabled:
+            if self.judge.v5.max_rules <= 0:
+                raise ValueError("judge.v5.max_rules must be positive for v5.")
+            if self.judge.warmup_rollouts <= 0:
+                raise ValueError("v5 rules protocols require judge.warmup_rollouts > 0.")
         if not self.budget.active_limits():
             raise ValueError("At least one budget limit must be set.")
 
@@ -183,10 +199,11 @@ def parse_config(payload: dict[str, Any], source_path: Path | None = None) -> Ex
         ),
         judge=JudgeConfig(
             **{
-                **{k: v for k, v in judge_payload.items() if k not in {"model", "combined_strategy", "v3"}},
+                **{k: v for k, v in judge_payload.items() if k not in {"model", "combined_strategy", "v3", "v5"}},
                 "model": _optional_model(judge_payload.get("model")),
                 "combined_strategy": CombinedStrategyConfig(**judge_payload.get("combined_strategy", {})),
                 "v3": V3Config(**judge_payload.get("v3", {})),
+                "v5": V5Config(**judge_payload.get("v5", {})),
             }
         ),
         program=ProgramConfig(

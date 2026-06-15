@@ -27,6 +27,7 @@ from .judge_memory import (
     teacher_label_from_scores,
     teacher_preferred_prompt,
 )
+from gepa_artifact.utils.lm_io_trace import lm_trace_context
 from dspy import Example
 from typing import List, Set
 from collections import Counter
@@ -123,6 +124,7 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
         num_dspy_examples_per_gepa_step=3,
         max_metric_calls=None,
         max_total_api_calls=None,
+        max_total_search_tokens=None,
         api_call_hard_limit=None,
         max_search_iterations=None,
         set_for_merge_minibatch='train',  # 'train', 'val', or 'both'
@@ -142,7 +144,7 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
         combined_validation_score_scale: float = 100.0,
         combined_min_surrogate_gain: float = 0.01,
         retained_validation_fraction: float = 100.0,
-        validation_sampling_mode: str = "random_per_iteration",
+        validation_sampling_mode: str = "fixed",
     ):
         # Exactly one primary stopping constraint should be set.
         assert (
@@ -150,10 +152,11 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
             + (max_evals_per_trainval_instance is not None)
             + (num_iters is not None)
             + (max_total_api_calls is not None)
+            + (max_total_search_tokens is not None)
             + (max_search_iterations is not None)
-        ) == 1, "Exactly one of max_metric_calls, max_evals_per_trainval_instance, num_iters, max_total_api_calls or max_search_iterations should be set. You set max_metric_calls={}, max_evals_per_trainval_instance={}, num_iters={}, max_total_api_calls={}, max_search_iterations={}".format(
-            max_metric_calls, max_evals_per_trainval_instance, num_iters, max_total_api_calls, max_search_iterations
-        )   
+        ) == 1, "Exactly one of max_metric_calls, max_evals_per_trainval_instance, num_iters, max_total_api_calls, max_total_search_tokens or max_search_iterations should be set. You set max_metric_calls={}, max_evals_per_trainval_instance={}, num_iters={}, max_total_api_calls={}, max_total_search_tokens={}, max_search_iterations={}".format(
+            max_metric_calls, max_evals_per_trainval_instance, num_iters, max_total_api_calls, max_total_search_tokens, max_search_iterations
+        )
 
         self.named_predictor_to_feedback_fn_map = named_predictor_to_feedback_fn_map
         self.knowledgebase_qe = knowledgebase_qe
@@ -162,7 +165,7 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
         self.run_dir = run_dir
         self.run_linearized_gepa = run_linearized_gepa
         self.num_threads = num_threads
-        
+
         self.failure_score = failure_score
         self.perfect_score = perfect_score
         self.teacher_lm = teacher_lm
@@ -174,6 +177,7 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
         self.max_evals_per_trainval_instance = max_evals_per_trainval_instance
         self.max_metric_calls = max_metric_calls
         self.max_total_api_calls = max_total_api_calls
+        self.max_total_search_tokens = max_total_search_tokens
         self.api_call_hard_limit = api_call_hard_limit
         self.max_search_iterations = max_search_iterations
 
@@ -205,9 +209,12 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
         self.combined_validation_score_scale = combined_validation_score_scale
         self.combined_min_surrogate_gain = combined_min_surrogate_gain
         self.retained_validation_fraction = retained_validation_fraction
+        if validation_sampling_mode != "fixed":
+            raise ValueError(
+                "validation_sampling_mode='random_per_iteration' has been removed. "
+                "Retained validation examples must be sampled once before GEPA starts and kept fixed."
+            )
         self.validation_sampling_mode = validation_sampling_mode
-        self._full_valset: list = None
-        self._current_valset_subsample: list = None
         self.judge_lm = judge_lm
         self.judge_learned_guide_path = judge_learned_guide_path
         self._learned_judge_guide_text = None
@@ -233,7 +240,7 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
         self.num_dspy_examples_per_gepa_step = num_dspy_examples_per_gepa_step
 
         self.add_format_failure_as_feedback = add_format_failure_as_feedback
-        
+
         self.shuffled_trainset_ids = []
         self.epoch = -1
         self.id_freqs = Counter()
@@ -244,7 +251,7 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
     ):
         if valset is not None:
             self.valset_provided = True
-        
+
         assert trainset is not None, "Trainset must be provided"
 
         gepa_state = self.gepa(
@@ -294,7 +301,7 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
         assert end_idx <= len(self.shuffled_trainset_ids), f"End index {end_idx} is out of bounds for shuffled trainset length {len(self.shuffled_trainset_ids)}"
         selected_ids = self.shuffled_trainset_ids[base_idx:end_idx]
         return selected_ids
-    
+
     def select_eval_subsample_for_merged_program(
         self,
         scores1,
@@ -328,7 +335,7 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                 # All unique exhausted; use replacement
                 selected += rng.choices(list(all_indices), k=remaining)
         return selected[:num_subsample_ids]
-    
+
     def get_pareto_front_programs(self, gepa_state: GEPAState) -> List[Set[int]]:
         return (
             gepa_state.program_at_pareto_front_valset + \
@@ -339,14 +346,14 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                 # {idxmax(gepa_state.program_full_scores)}, # Add best on trainset
             ] # TODO: Think about whether this should be added or not. Make this configurable.
         ) if self.track_scores_on == 'train_val' else gepa_state.program_at_pareto_front_valset
-    
+
     def select_next_candidate_to_update(self, gepa_state: GEPAState):
         # TODO: Update this method to use pareto front from both train and val sets configurable
         assert len(gepa_state.per_program_tracked_scores) == len(gepa_state.program_candidates)
 
         if not gepa_state.running_linearized_gepa:
             curr_prog_id = select_program_candidate_from_pareto_front(
-                self.get_pareto_front_programs(gepa_state), 
+                self.get_pareto_front_programs(gepa_state),
                 gepa_state.per_program_tracked_scores,
                 gepa_state.rng1,
             )
@@ -385,6 +392,16 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
         optimizer_usage = self.get_lm_usage_snapshot(dspy.dsp.utils.settings.lm)
         judge_usage = self.get_lm_usage_snapshot(self.judge_lm)
         return optimizer_usage["api_calls"] + judge_usage["api_calls"]
+
+    def get_total_search_tokens(self):
+        optimizer_usage = self.get_lm_usage_snapshot(dspy.dsp.utils.settings.lm)
+        judge_usage = self.get_lm_usage_snapshot(self.judge_lm)
+        return (
+            optimizer_usage["input_tokens"]
+            + optimizer_usage["output_tokens"]
+            + judge_usage["input_tokens"]
+            + judge_usage["output_tokens"]
+        )
 
     def build_cost_accounting_payload(self, optimizer_usage: dict, judge_usage: dict, gepa_state: GEPAState):
         validation_input_tokens = getattr(gepa_state, "validation_input_tokens", 0)
@@ -452,21 +469,6 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
             f"Student preferred `{student_preferred_prompt}`, but validation teacher preferred `{teacher_preferred}`."
             f"{delta_note}"
         )
-
-    def _update_validation_subsample(self, full_valset, iteration_seed):
-        """Replace the valset evaluator devset with a random subsample for this iteration."""
-        if self.validation_sampling_mode != "random_per_iteration":
-            return
-        if self.retained_validation_fraction >= 100.0:
-            return
-        if full_valset is None:
-            return
-        fraction = self.retained_validation_fraction
-        keep_count = max(1, math.ceil(len(full_valset) * fraction / 100.0))
-        rng = random.Random(iteration_seed)
-        indices = list(range(len(full_valset)))
-        rng.shuffle(indices)
-        self._current_valset_subsample = [full_valset[i] for i in sorted(indices[:keep_count])]
 
     def compute_combined_selection_metadata(self, old_validation_score, new_validation_score, judge_decision: dict):
         validation_delta = float(new_validation_score) - float(old_validation_score)
@@ -761,9 +763,10 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
             ],
             "selection_mode": self.selection_mode,
         }
-        self.append_jsonl_record("judge_alignment_memory_bank.jsonl", record)
-        if self.judge_alignment_memory_records is not None:
-            self.judge_alignment_memory_records.append(record)
+        if not ranking_match:
+            self.append_jsonl_record("judge_alignment_memory_bank.jsonl", record)
+            if self.judge_alignment_memory_records is not None:
+                self.judge_alignment_memory_records.append(record)
         return record
 
     def append_judge_memory_retrieval_record(
@@ -835,7 +838,7 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
         if extra:
             payload.update(extra)
         self.append_jsonl_record("metric_call_checkpoints.jsonl", payload)
-    
+
     def run_full_eval_add_new_program_to_gepa_tree(
         self,
         new_program: dspy.Module,
@@ -848,12 +851,17 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
         validation_usage_before = self.get_lm_usage_snapshot(dspy.dsp.utils.settings.lm or new_program.get_lm())
 
         # Calculate metrics for new program and update gepa state
-        if self.track_scores_on == 'train_val':
-            trainset_score, trainset_outputs, trainset_subscores = trainset_evaluator(new_program)
-        else:
-            assert self.track_scores_on == 'val', "track_scores_on should be either 'val' or 'train_val'. You set track_scores_on={}".format(self.track_scores_on)
-            trainset_score, trainset_outputs, trainset_subscores = None, None, None
-        valset_score, valset_outputs, valset_subscores = valset_evaluator(new_program)
+        with lm_trace_context(
+            "validation_full_eval",
+            iteration=gepa_state.i + 1,
+            parent_program_idx=parent_program_idx,
+        ):
+            if self.track_scores_on == 'train_val':
+                trainset_score, trainset_outputs, trainset_subscores = trainset_evaluator(new_program)
+            else:
+                assert self.track_scores_on == 'val', "track_scores_on should be either 'val' or 'train_val'. You set track_scores_on={}".format(self.track_scores_on)
+                trainset_score, trainset_outputs, trainset_subscores = None, None, None
+            valset_score, valset_outputs, valset_subscores = valset_evaluator(new_program)
         self.increment_validation_usage_from_lm(gepa_state, dspy.dsp.utils.settings.lm or new_program.get_lm(), validation_usage_before)
 
         # We have run one full eval of the new program on train set and val set
@@ -978,9 +986,6 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
         if self.num_threads is None:
             self.num_threads = os.cpu_count()
 
-        # Preserve the full valset for per-iteration random subsampling.
-        self._full_valset = valset
-
         trainset_evaluator = LegacyEvaluate(
             devset=trainset,
             metric=self.metric_fn,
@@ -996,13 +1001,8 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
             if valset is None:
                 valset = trainset
 
-            # Set initial random validation subsample before computing train_val_size
-            # so the per-instance accounting matches the actual evaluated set size.
-            self._update_validation_subsample(valset, self.seed + 7919)
-            effective_valset = self._current_valset_subsample if self._current_valset_subsample is not None else valset
-
             valset_evaluator = LegacyEvaluate(
-                devset=effective_valset,
+                devset=valset,
                 metric=self.metric_fn,
                 num_threads=self.num_threads,
                 return_all_scores=True,
@@ -1011,7 +1011,7 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                 provide_traceback=True,
                 max_errors=len(valset) * 100  # upper bound from full set
             )
-            self.train_val_size = len(trainset) + len(effective_valset)
+            self.train_val_size = len(trainset) + len(valset)
         else:
             valset_evaluator = None
             self.train_val_size = len(trainset)
@@ -1031,10 +1031,10 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
         )
 
         self.gepa_state = gepa_state
-        
+
         if self.track_scores_on == 'train_val':
             assert len(gepa_state.pareto_front) == len(trainset)
-        
+
         if self.selection_mode == 'validation':
             expected_valset_len = len(valset_evaluator.devset) if valset_evaluator is not None else len(valset)
             assert len(gepa_state.pareto_front_valset) == expected_valset_len, f"Pareto front valset length {len(gepa_state.pareto_front_valset)} does not match valset length {expected_valset_len}"
@@ -1089,16 +1089,13 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
             (self.max_metric_calls is None or gepa_state.total_num_evals < self.max_metric_calls) and
             (self.max_search_iterations is None or gepa_state.i + 1 < self.max_search_iterations) and
             (self.max_total_api_calls is None or self.get_total_search_api_calls() < self.max_total_api_calls) and
+            (self.max_total_search_tokens is None or self.get_total_search_tokens() < self.max_total_search_tokens) and
             (self.api_call_hard_limit is None or self.get_total_search_api_calls() < self.api_call_hard_limit)
         ):
             assert gepa_state.is_consistent(), "GEPA state is inconsistent, please check the implementation"
             try:
                 gepa_state.save(self.run_dir)
                 gepa_state.i += 1
-                if valset_evaluator is not None:
-                    self._update_validation_subsample(self._full_valset, self.seed + 7919 + gepa_state.i * 10007)
-                    if self._current_valset_subsample is not None:
-                        valset_evaluator.devset = self._current_valset_subsample
                 gepa_state.full_program_trace.append({"i": gepa_state.i})
                 gepa_state.full_program_trace[-1]["metric_calls_before_iteration"] = gepa_state.total_num_evals
 
@@ -1170,7 +1167,13 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                         subsample_evaluator = LegacyEvaluate(**subsample_evaluator_args)
 
                         minibatch_usage_before = self.get_lm_usage_snapshot(dspy.dsp.utils.settings.lm or new_program.get_lm())
-                        new_program_subsample_scores = subsample_evaluator(new_program)[2]
+                        with lm_trace_context(
+                            "merge_minibatch_eval",
+                            iteration=gepa_state.i + 1,
+                            parent_program_idx=[id1, id2],
+                            subsample_ids=subsample_ids,
+                        ):
+                            new_program_subsample_scores = subsample_evaluator(new_program)[2]
                         self.increment_minibatch_usage_from_lm(
                             gepa_state,
                             dspy.dsp.utils.settings.lm or new_program.get_lm(),
@@ -1207,7 +1210,7 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                         continue
                     else:
                         self.logger.log(f"Iteration {gepa_state.i+1}: No merge candidates found")
-                
+
                 last_iter_found_new_program = False
 
                 curr_prog_id = self.select_next_candidate_to_update(gepa_state)
@@ -1246,21 +1249,28 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                 gepa_state.full_program_trace[-1]['subsample_ids'] = subsample_ids
 
                 minibatch_usage_before = self.get_lm_usage_snapshot(dspy.dsp.utils.settings.lm or curr_prog.get_lm())
-                dataset_with_feedback, subsample_score, subsample_scores = capture_module_trace_with_feedback(
-                    module, 
-                    curr_prog, 
-                    [trainset[i] for i in subsample_ids], 
-                    self.metric_fn, 
-                    self.logger, 
-                    gepa_state,
-                    self.skip_perfect_score and not self.feedback_only_llm_judge,
-                    self.perfect_score,
-                    failure_score=self.failure_score,
-                    format_failure_score=self.failure_score, # TODO: Get a proper value for this
-                    feedback_func=feedback_func,
-                    add_format_failure_as_feedback=self.add_format_failure_as_feedback,
-                    num_threads=self.num_threads,
-                )
+                with lm_trace_context(
+                    "minibatch_feedback",
+                    iteration=gepa_state.i + 1,
+                    selected_program_candidate=curr_prog_id,
+                    predictor_name=predictor_name_to_update,
+                    subsample_ids=subsample_ids,
+                ):
+                    dataset_with_feedback, subsample_score, subsample_scores = capture_module_trace_with_feedback(
+                        module,
+                        curr_prog,
+                        [trainset[i] for i in subsample_ids],
+                        self.metric_fn,
+                        self.logger,
+                        gepa_state,
+                        self.skip_perfect_score and not self.feedback_only_llm_judge,
+                        self.perfect_score,
+                        failure_score=self.failure_score,
+                        format_failure_score=self.failure_score, # TODO: Get a proper value for this
+                        feedback_func=feedback_func,
+                        add_format_failure_as_feedback=self.add_format_failure_as_feedback,
+                        num_threads=self.num_threads,
+                    )
                 self.increment_minibatch_usage_from_lm(
                     gepa_state,
                     dspy.dsp.utils.settings.lm or curr_prog.get_lm(),
@@ -1288,14 +1298,20 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                     }, step=gepa_state.i+1)
 
                 instruction_propose_module = ProposeNewInstructionModule(
-                    base_program=module, 
+                    base_program=module,
                     instruction_lm=self.teacher_lm or dspy.dsp.utils.settings.lm or curr_prog.get_lm(),
-                    dataset_with_feedback=dataset_with_feedback, 
+                    dataset_with_feedback=dataset_with_feedback,
                     knowledgebase_qe=self.knowledgebase_qe)
                 if self.teacher_lm is not None:
                     instruction_propose_module.instruction_propose_module.set_lm(self.teacher_lm)
                 try:
-                    output = instruction_propose_module.compile()
+                    with lm_trace_context(
+                        "instruction_proposal",
+                        iteration=gepa_state.i + 1,
+                        selected_program_candidate=curr_prog_id,
+                        predictor_name=predictor_name_to_update,
+                    ):
+                        output = instruction_propose_module.compile()
                     with open(os.path.join(self.run_dir, "instruction_proposer_inpouts.jsonl"), 'a') as f:
                         f.write(json.dumps(output, default=lambda x: {**x}) + "\n")
                     new_instruction = output['new_instruction']
@@ -1333,7 +1349,14 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                     subsample_evaluator_args['max_errors'] = len(subsample_ids) * 100
                     subsample_evaluator = LegacyEvaluate(**subsample_evaluator_args)
                     minibatch_usage_before = self.get_lm_usage_snapshot(dspy.dsp.utils.settings.lm or new_program.get_lm())
-                    new_subsample_scores = subsample_evaluator(new_program)[2]
+                    with lm_trace_context(
+                        "minibatch_candidate_eval",
+                        iteration=gepa_state.i + 1,
+                        selected_program_candidate=curr_prog_id,
+                        predictor_name=predictor_name_to_update,
+                        subsample_ids=subsample_ids,
+                    ):
+                        new_subsample_scores = subsample_evaluator(new_program)[2]
                     self.increment_minibatch_usage_from_lm(
                         gepa_state,
                         dspy.dsp.utils.settings.lm or new_program.get_lm(),
@@ -1363,7 +1386,13 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                     if new_subsample_score <= subsample_score:
                         if self.always_validate_for_teacher_memory:
                             validation_usage_before = self.get_lm_usage_snapshot(dspy.dsp.utils.settings.lm or new_program.get_lm())
-                            new_valset_score, _, new_valset_subscores = valset_evaluator(new_program)
+                            with lm_trace_context(
+                                "validation_teacher_memory_eval",
+                                iteration=gepa_state.i + 1,
+                                selected_program_candidate=curr_prog_id,
+                                predictor_name=predictor_name_to_update,
+                            ):
+                                new_valset_score, _, new_valset_subscores = valset_evaluator(new_program)
                             self.increment_validation_usage_from_lm(
                                 gepa_state,
                                 dspy.dsp.utils.settings.lm or new_program.get_lm(),
@@ -1445,15 +1474,21 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                                 retrieved_alignment_records,
                                 max_cases=self.judge_memory_top_k,
                             ) if retrieved_alignment_records else None
-                            student_prediction = predict_alignment_pairwise_preference(
-                                judge_lm=effective_alignment_judge_lm,
+                            with lm_trace_context(
+                                "alignment_judge",
+                                iteration=gepa_state.i + 1,
+                                selected_program_candidate=curr_prog_id,
                                 predictor_name=predictor_name_to_update,
-                                old_instruction=current_instruction,
-                                new_instruction=new_instruction,
-                                dataset_with_feedback=dataset_with_feedback,
-                                alignment_summary=alignment_summary,
-                                alignment_context=alignment_context,
-                            )
+                            ):
+                                student_prediction = predict_alignment_pairwise_preference(
+                                    judge_lm=effective_alignment_judge_lm,
+                                    predictor_name=predictor_name_to_update,
+                                    old_instruction=current_instruction,
+                                    new_instruction=new_instruction,
+                                    dataset_with_feedback=dataset_with_feedback,
+                                    alignment_summary=alignment_summary,
+                                    alignment_context=alignment_context,
+                                )
                             alignment_record = self.append_validation_alignment_memory_record(
                                 gepa_state=gepa_state,
                                 selected_program_candidate=curr_prog_id,
@@ -1564,7 +1599,13 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                         old_validation_score = self.get_combined_validation_score_for_program(gepa_state, curr_prog_id)
                         if old_validation_score is None:
                             validation_usage_before = self.get_lm_usage_snapshot(dspy.dsp.utils.settings.lm or curr_prog.get_lm())
-                            old_valset_score, _, old_valset_subscores = valset_evaluator(curr_prog)
+                            with lm_trace_context(
+                                "validation_parent_recovery_eval",
+                                iteration=gepa_state.i + 1,
+                                selected_program_candidate=curr_prog_id,
+                                predictor_name=predictor_name_to_update,
+                            ):
+                                old_valset_score, _, old_valset_subscores = valset_evaluator(curr_prog)
                             self.increment_validation_usage_from_lm(
                                 gepa_state,
                                 dspy.dsp.utils.settings.lm or curr_prog.get_lm(),
@@ -1592,7 +1633,13 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                             )
 
                         validation_usage_before = self.get_lm_usage_snapshot(dspy.dsp.utils.settings.lm or new_program.get_lm())
-                        new_validation_score, _, new_validation_subscores = valset_evaluator(new_program)
+                        with lm_trace_context(
+                            "validation_candidate_eval",
+                            iteration=gepa_state.i + 1,
+                            selected_program_candidate=curr_prog_id,
+                            predictor_name=predictor_name_to_update,
+                        ):
+                            new_validation_score, _, new_validation_subscores = valset_evaluator(new_program)
                         self.increment_validation_usage_from_lm(
                             gepa_state,
                             dspy.dsp.utils.settings.lm or new_program.get_lm(),
@@ -1613,19 +1660,27 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                             },
                         )
 
-                        judge_decision = judge_prompt_candidate(
-                            judge_lm=effective_judge_lm,
+                        with lm_trace_context(
+                            "llm_judge",
+                            iteration=gepa_state.i + 1,
+                            selected_program_candidate=curr_prog_id,
                             predictor_name=predictor_name_to_update,
-                            old_instruction=current_instruction,
-                            new_instruction=new_instruction,
-                            dataset_with_feedback=dataset_with_feedback,
-                            memory_summary=memory_summary,
-                            memory_context=memory_context,
-                            alignment_summary=alignment_summary,
-                            alignment_context=alignment_context,
-                            learned_judge_guide=learned_judge_guide,
                             selection_variant="feedback_only",
-                        )
+                            combined_selection=True,
+                        ):
+                            judge_decision = judge_prompt_candidate(
+                                judge_lm=effective_judge_lm,
+                                predictor_name=predictor_name_to_update,
+                                old_instruction=current_instruction,
+                                new_instruction=new_instruction,
+                                dataset_with_feedback=dataset_with_feedback,
+                                memory_summary=memory_summary,
+                                memory_context=memory_context,
+                                alignment_summary=alignment_summary,
+                                alignment_context=alignment_context,
+                                learned_judge_guide=learned_judge_guide,
+                                selection_variant="feedback_only",
+                            )
                         combined_metadata = self.compute_combined_selection_metadata(
                             old_validation_score=old_validation_score,
                             new_validation_score=new_validation_score,
@@ -1766,7 +1821,15 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                         subsample_evaluator_args['max_errors'] = len(subsample_ids) * 100
                         subsample_evaluator = LegacyEvaluate(**subsample_evaluator_args)
                         minibatch_usage_before = self.get_lm_usage_snapshot(dspy.dsp.utils.settings.lm or new_program.get_lm())
-                        new_subsample_scores = subsample_evaluator(new_program)[2]
+                        with lm_trace_context(
+                            "minibatch_candidate_eval",
+                            iteration=gepa_state.i + 1,
+                            selected_program_candidate=curr_prog_id,
+                            predictor_name=predictor_name_to_update,
+                            subsample_ids=subsample_ids,
+                            score_aware_judge=True,
+                        ):
+                            new_subsample_scores = subsample_evaluator(new_program)[2]
                         self.increment_minibatch_usage_from_lm(
                             gepa_state,
                             dspy.dsp.utils.settings.lm or new_program.get_lm(),
@@ -1793,35 +1856,49 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                             self.logger.log(f"Iteration {gepa_state.i+1}: New subsample score is not better, skipping")
                             continue
                         self.logger.log(f"Iteration {gepa_state.i+1}: New subsample score is better, going from {subsample_score} to {new_subsample_score}, updating program candidate!")
-                        judge_decision = judge_prompt_candidate(
-                            judge_lm=effective_judge_lm,
+                        with lm_trace_context(
+                            "llm_judge",
+                            iteration=gepa_state.i + 1,
+                            selected_program_candidate=curr_prog_id,
                             predictor_name=predictor_name_to_update,
-                            old_instruction=current_instruction,
-                            new_instruction=new_instruction,
-                            dataset_with_feedback=dataset_with_feedback,
-                            memory_summary=memory_summary,
-                            memory_context=memory_context,
-                            alignment_summary=alignment_summary,
-                            alignment_context=alignment_context,
-                            learned_judge_guide=learned_judge_guide,
-                            old_subsample_score=subsample_score,
-                            new_subsample_score=new_subsample_score,
                             selection_variant="score_aware",
-                        )
+                        ):
+                            judge_decision = judge_prompt_candidate(
+                                judge_lm=effective_judge_lm,
+                                predictor_name=predictor_name_to_update,
+                                old_instruction=current_instruction,
+                                new_instruction=new_instruction,
+                                dataset_with_feedback=dataset_with_feedback,
+                                memory_summary=memory_summary,
+                                memory_context=memory_context,
+                                alignment_summary=alignment_summary,
+                                alignment_context=alignment_context,
+                                learned_judge_guide=learned_judge_guide,
+                                old_subsample_score=subsample_score,
+                                new_subsample_score=new_subsample_score,
+                                selection_variant="score_aware",
+                            )
                     else:
-                        judge_decision = judge_prompt_candidate(
-                            judge_lm=effective_judge_lm,
+                        with lm_trace_context(
+                            "llm_judge",
+                            iteration=gepa_state.i + 1,
+                            selected_program_candidate=curr_prog_id,
                             predictor_name=predictor_name_to_update,
-                            old_instruction=current_instruction,
-                            new_instruction=new_instruction,
-                            dataset_with_feedback=dataset_with_feedback,
-                            memory_summary=memory_summary,
-                            memory_context=memory_context,
-                            alignment_summary=alignment_summary,
-                            alignment_context=alignment_context,
-                            learned_judge_guide=learned_judge_guide,
                             selection_variant="feedback_only",
-                        )
+                        ):
+                            judge_decision = judge_prompt_candidate(
+                                judge_lm=effective_judge_lm,
+                                predictor_name=predictor_name_to_update,
+                                old_instruction=current_instruction,
+                                new_instruction=new_instruction,
+                                dataset_with_feedback=dataset_with_feedback,
+                                memory_summary=memory_summary,
+                                memory_context=memory_context,
+                                alignment_summary=alignment_summary,
+                                alignment_context=alignment_context,
+                                learned_judge_guide=learned_judge_guide,
+                                selection_variant="feedback_only",
+                            )
                     judge_decision_record = {
                         "iteration": gepa_state.i + 1,
                         "total_metric_calls_at_judge": gepa_state.total_num_evals,
@@ -1959,7 +2036,7 @@ class GEPA(dspy.teleprompt.teleprompt.Teleprompter):
                         }
                         iteration_summary.update(self.build_cost_accounting_payload(optimizer_usage, judge_usage, gepa_state))
                         self.append_jsonl_record("iteration_summary.jsonl", iteration_summary)
-        
+
         gepa_state.save(self.run_dir)
 
         return gepa_state

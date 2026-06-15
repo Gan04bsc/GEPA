@@ -29,6 +29,16 @@ class TeacherPair:
         return "new" if delta is not None and delta > 0 else "old"
 
 
+@dataclass(frozen=True)
+class PromptRule:
+    rule_id: str
+    rule: str
+    applies_when: str
+    avoid_when: str
+    evidence: str
+    source_record_ids: tuple[str, ...] = ()
+
+
 def load_teacher_pairs(path: str | Path) -> list[TeacherPair]:
     records: list[TeacherPair] = []
     with Path(path).open("r", encoding="utf-8") as handle:
@@ -47,6 +57,37 @@ def load_teacher_pairs(path: str | Path) -> list[TeacherPair]:
                 )
             )
     return records
+
+
+def load_rules_library(path: str | Path) -> list[PromptRule]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    rules = payload.get("rules", payload if isinstance(payload, list) else [])
+    records: list[PromptRule] = []
+    for idx, rule in enumerate(rules, start=1):
+        if isinstance(rule, str):
+            records.append(
+                PromptRule(
+                    rule_id=f"R{idx}",
+                    rule=rule,
+                    applies_when="unspecified",
+                    avoid_when="unspecified",
+                    evidence="unspecified",
+                )
+            )
+            continue
+        if not isinstance(rule, dict):
+            continue
+        records.append(
+            PromptRule(
+                rule_id=str(rule.get("rule_id") or f"R{idx}"),
+                rule=str(rule.get("rule") or ""),
+                applies_when=str(rule.get("applies_when") or "unspecified"),
+                avoid_when=str(rule.get("avoid_when") or "unspecified"),
+                evidence=str(rule.get("evidence") or "unspecified"),
+                source_record_ids=tuple(str(item) for item in (rule.get("source_record_ids") or ())),
+            )
+        )
+    return [rule for rule in records if rule.rule]
 
 
 def select_distilled_pairs(
@@ -73,6 +114,41 @@ def select_distilled_pairs(
         if len(selected) >= max_pairs:
             break
     return selected
+
+
+def build_rules_guide(rules: list[PromptRule]) -> str:
+    if not rules:
+        return "No warmup rules are available. Use current minibatch feedback conservatively."
+    lines = [
+        "Warmup rules library for GEPA prompt selection.",
+        "Use these rules as weak learned policy, not as current validation evidence.",
+        "",
+        "Rules:",
+    ]
+    for rule in rules:
+        lines.extend(
+            [
+                f"{rule.rule_id}. {rule.rule}",
+                f"Applies when: {rule.applies_when}",
+                f"Avoid when: {rule.avoid_when}",
+                f"Evidence: {_truncate(rule.evidence, 260)}",
+                f"Source records: {', '.join(rule.source_record_ids) or 'unspecified'}",
+                "",
+            ]
+        )
+    return "\n".join(lines).strip()
+
+
+def build_rules_plus_fewshot_guide(rules: list[PromptRule], pairs: list[TeacherPair]) -> str:
+    rules_text = build_rules_guide(rules)
+    pair_text = build_learned_guide(pairs) if pairs else "No distilled teacher pairs are available."
+    return "\n\n".join(
+        [
+            rules_text,
+            "Few-shot validation-teacher calibration cases:",
+            pair_text,
+        ]
+    )
 
 
 def build_learned_guide(pairs: list[TeacherPair]) -> str:
@@ -128,4 +204,3 @@ def _jaccard(a: set[str], b: set[str]) -> float:
 
 def _truncate(text: str, max_chars: int) -> str:
     return text if len(text) <= max_chars else text[: max_chars - 3] + "..."
-

@@ -26,6 +26,7 @@ run:
 budget:
   # Choose one primary stopping condition for production runs.
   max_llm_calls: null            # Example: 5000
+  max_search_tokens: null        # Example: 10000000; optimizer + judge tokens only
   max_search_iterations: 200
   max_metric_calls: null
   max_seconds: null
@@ -41,7 +42,7 @@ validation:
 
 judge:
   enabled: false
-  version: "v1"                  # v1 | v2 | v3 | combined
+  version: "v1"                  # v1 | v2 | v3 | v4 | v5_rules_only | v5_rules_fewshot | combined
   combined: false
   warmup_rollouts: 0
   strict_learned_guide: false
@@ -62,6 +63,11 @@ judge:
     distilled_pair_count: 5
     similarity_threshold: 0.86
     use_strict_memory: true
+  v5:
+    max_rules: 50
+    include_fewshot: null        # null follows version; false for v5_rules_only, true for v5_rules_fewshot
+    teacher_pair_count: 3
+    alignment_pair_count: 2
 
 program:
   optimizer_lm:

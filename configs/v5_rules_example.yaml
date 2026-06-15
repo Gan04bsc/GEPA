@@ -1,0 +1,75 @@
+# Example v5 rules experiment.
+# Data, caches, logs, and results should stay outside this repository.
+
+experiment:
+  name: "example_v5_rules_fewshot"
+  seed: 130
+  benchmark: "HotpotQABench"
+  output_dir: "../runs/example_v5_rules_fewshot"
+  backend:
+    type: "dry_run"              # dry_run | artifact
+    artifact_root: null
+    benchmark_index: 0
+    program_index: 0
+    program_name: "HotpotMultiHop"
+    optimizer_index: 3
+    optimizer_name: "GEPA"
+    setting_name: "example_v5_rules_fewshot"
+
+run:
+  num_threads: 1
+  resume: true
+  cache_policy: "disabled"
+  final_evaluation: true
+
+budget:
+  max_llm_calls: 6000
+  max_search_tokens: null
+  max_search_iterations: null
+  max_metric_calls: null
+  max_seconds: null
+
+validation:
+  retained_fraction: 0.05
+  sampling_mode: "fixed"
+  decay:
+    enabled: true
+    metric: "validation_score"
+    min_delta: 0.0
+    normalize_scores: false
+
+judge:
+  enabled: true
+  version: "v5_rules_fewshot"    # v5_rules_only | v5_rules_fewshot
+  combined: false
+  warmup_rollouts: 50
+  strict_learned_guide: true
+  memory_top_k: 3
+  same_predictor_only: true
+  model:
+    name: "qwen3-8b"
+    api_base: "http://127.0.0.1:8000/v1"
+    api_key_env: "OPENAI_API_KEY"
+    temperature: 0.6
+  v5:
+    max_rules: 50
+    include_fewshot: true
+    teacher_pair_count: 3
+    alignment_pair_count: 2
+
+program:
+  optimizer_lm:
+    name: "qwen3-8b"
+    api_base: "http://127.0.0.1:8000/v1"
+    api_key_env: "OPENAI_API_KEY"
+    temperature: 0.6
+  task_lm:
+    name: "qwen3-8b"
+    api_base: "http://127.0.0.1:8000/v1"
+    api_key_env: "OPENAI_API_KEY"
+    temperature: 0.6
+
+paths:
+  data_dir: "../data"
+  result_dir: "../runs"
+  cache_dir: "../cache"

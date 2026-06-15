@@ -39,9 +39,12 @@ def build_selection_prompt(
     if version in {"v1", "combined"}:
         score_keys = '  "old_score": float between 0 and 100,\n  "new_score": float between 0 and 100,\n'
     guide_block = f"\nLearned guide:\n{learned_guide}\n" if learned_guide else ""
+    if version.startswith("v5") and learned_guide:
+        guide_block = f"\nWarmup rules library and optional calibration examples:\n{learned_guide}\n"
     return f"""You are a GEPA prompt-selection judge.
 
 Compare OLD and NEW instructions for the target predictor. Use only the prompt diff, minibatch feedback, and optional learned guide.
+For v5 rules protocols, treat the rules library as weak policy distilled from warmup validation. It is not current validation evidence.
 Return exactly one JSON object:
 {{
 {score_keys}  "preferred_prompt": "old" or "new",
@@ -109,4 +112,3 @@ def _optional_float(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
-
